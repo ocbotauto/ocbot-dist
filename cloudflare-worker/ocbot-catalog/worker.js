@@ -121,13 +121,21 @@ async function resolveAndStoreCgId(env, ticker) {
 // SafeTrade (safe.trade) — многие новые майнерские монеты (включая те, что ещё не попали на CoinGecko/
 // WhatToMine) листятся именно там первым делом. Публичный тикер-эндпоинт (движок на базе Peatio, как и у
 // других бирж того же стека) отдаёт все пары одним запросом: ключ — нижний регистр пары, напр. "noidusdt".
+// Общий кэш ответа /api/v2/tickers на один вызов (тикеров может быть несколько, а дёргать биржу на
+// каждый — лишнее, она и так отдаёт все пары одним запросом). Это модульная переменная воркера — живёт,
+// пока жив конкретный изолят Cloudflare, сбрасывается между холодными стартами, это ожидаемо.
+let safeTradeTickersPromise = null;
+function safeTradeTickers() {
+  if (!safeTradeTickersPromise) {
+    safeTradeTickersPromise = fetch("https://safe.trade/api/v2/tickers")
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+  }
+  return safeTradeTickersPromise;
+}
 async function safeTradeHasMarket(ticker) {
-  try {
-    const r = await fetch("https://safe.trade/api/v2/tickers");
-    if (!r.ok) return false;
-    const all = await r.json();
-    return !!(all && all[ticker.toLowerCase() + "usdt"]);
-  } catch { return false; }
+  const all = await safeTradeTickers();
+  return !!(all && all[ticker.toLowerCase() + "usdt"]);
 }
 
 // Для каждого нового алгоритма, которого раньше не было ни в сопоставлении (coin:*), ни в списке уже
@@ -314,15 +322,14 @@ async function fetchGateUsd(ticker) {
 
 // SafeTrade: многие новые майнерские монеты (включая те, что ещё не торгуются на крупных биржах и не
 // попали на CoinGecko/WhatToMine) листятся именно там первым делом. Эндпоинт отдаёт ВСЕ пары одним
-// запросом (ключ — нижний регистр пары, напр. "noidusdt"); курс там только в USDT, поэтому переводим в
-// eur/rub через тот же usdFx(), что и для Gate.io.
+// запросом (ключ — нижний регистр пары, напр. "noidusdt"; курс — поле "last" ПРЯМО на самой паре, без
+// вложенного "ticker" — проверено на реальном ответе биржи); курс там только в USDT, поэтому переводим
+// в eur/rub через тот же usdFx(), что и для Gate.io.
 async function fetchSafeTradeUsd(ticker) {
   try {
-    const r = await fetch("https://safe.trade/api/v2/tickers");
-    if (!r.ok) return null;
-    const all = await r.json();
+    const all = await safeTradeTickers();
     const t = all && all[ticker.toLowerCase() + "usdt"];
-    const p = t && t.ticker && parseFloat(t.ticker.last);
+    const p = t && parseFloat(t.last);
     return p > 0 ? p : null;
   } catch { return null; }
 }
