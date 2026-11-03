@@ -133,9 +133,16 @@ function safeTradeTickers() {
   }
   return safeTradeTickersPromise;
 }
+// Пара в USDT есть не у всех монет на SafeTrade — у части листинг только в USDC (напр. nockusdc,
+// safeusdc). Пробуем обе котировки, USDT в приоритете (ликвиднее и не имеет собственной волатильности
+// к доллару, в отличие от USDC, который тоже не всегда ровно $1).
+function safeTradePair(all, ticker) {
+  const t = (SAFE_PAIR_BASE[ticker] || ticker).toLowerCase();
+  return all && (all[t + "usdt"] || all[t + "usdc"] || null);
+}
 async function safeTradeHasMarket(ticker) {
   const all = await safeTradeTickers();
-  return !!(all && all[ticker.toLowerCase() + "usdt"]);
+  return !!safeTradePair(all, ticker);
 }
 
 // Для каждого нового алгоритма, которого раньше не было ни в сопоставлении (coin:*), ни в списке уже
@@ -239,6 +246,10 @@ const CG_ID_OVERRIDE = { PRL: "pearl-2", QTC: "quantus" };
 // Пары Gate.io проверены вручную: "PRL_USDT" на Gate — это другой, не связанный токен;
 // нужная монета Pearl лежит в "PEARL_USDT".
 const GATE_PAIR = { PRL: "PEARL_USDT" };
+// То же самое для SafeTrade: ключ пары там строится из названия монеты (base_unit), а не всегда
+// совпадает с тикером из coinmap.json — PRL там торгуется под парой "pearlusdt", не "prlusdt".
+// Без этой записи SafeTrade как резерв для PRL молча не найдёт пару, даже если она есть.
+const SAFE_PAIR_BASE = { PRL: "pearl" };
 
 // Сопоставление тикера → id CoinGecko. Порядок: 1) сохранённое в KV (cgid:ТИКЕР — ставится через
 // /admin/resolve, /admin/setcoin или автоматически); 2) встроенный CG_ID_OVERRIDE; 3) поиск CoinGecko по
@@ -328,8 +339,11 @@ async function fetchGateUsd(ticker) {
 async function fetchSafeTradeUsd(ticker) {
   try {
     const all = await safeTradeTickers();
-    const t = all && all[ticker.toLowerCase() + "usdt"];
-    const p = t && parseFloat(t.last);
+    const t = safeTradePair(all, ticker);
+    // Защита от смены формата ответа биржи: в проверенном виде "last" лежит прямо на паре, но на
+    // случай, если когда-нибудь станет как у части других бирж на этом же движке (Peatio) — вложенным
+    // в "ticker" — пробуем оба варианта, лишь бы курс точно не потерялся молча.
+    const p = t && parseFloat(t.last ?? (t.ticker && t.ticker.last));
     return p > 0 ? p : null;
   } catch { return null; }
 }
