@@ -336,16 +336,23 @@ async function fetchGateUsd(ticker) {
 // запросом (ключ — нижний регистр пары, напр. "noidusdt"; курс — поле "last" ПРЯМО на самой паре, без
 // вложенного "ticker" — проверено на реальном ответе биржи); курс там только в USDT, поэтому переводим
 // в eur/rub через тот же usdFx(), что и для Gate.io.
-async function fetchSafeTradeUsd(ticker) {
+async function fetchSafeTradeUsd(ticker, debugOut) {
   try {
     const all = await safeTradeTickers();
+    if (debugOut) debugOut[ticker] = { gotTickers: !!all, keyCount: all ? Object.keys(all).length : 0 };
     const t = safeTradePair(all, ticker);
+    if (debugOut) debugOut[ticker].pairFound = !!t;
     // Защита от смены формата ответа биржи: в проверенном виде "last" лежит прямо на паре, но на
     // случай, если когда-нибудь станет как у части других бирж на этом же движке (Peatio) — вложенным
     // в "ticker" — пробуем оба варианта, лишь бы курс точно не потерялся молча.
-    const p = t && parseFloat(t.last ?? (t.ticker && t.ticker.last));
+    const raw = t && (t.last ?? (t.ticker && t.ticker.last));
+    if (debugOut) debugOut[ticker].raw = raw ?? null;
+    const p = parseFloat(raw);
     return p > 0 ? p : null;
-  } catch { return null; }
+  } catch (e) {
+    if (debugOut) debugOut[ticker] = { error: e && e.message ? e.message : String(e) };
+    return null;
+  }
 }
 
 async function usdFx(env) {
@@ -416,12 +423,13 @@ async function getPrices(env, tickers, debugOut) {
   if (missing.length) {
     try {
       const rates = await usdFx(env);
-      const fromSafeTrade = await Promise.all(missing.map((t) => fetchSafeTradeUsd(t).catch(() => null)));
+      const safeDebug = debugOut ? {} : null;
+      const fromSafeTrade = await Promise.all(missing.map((t) => fetchSafeTradeUsd(t, safeDebug).catch(() => null)));
       missing.forEach((t, i) => {
         const usd = fromSafeTrade[i];
         if (usd != null && rates) { fresh[t] = { usd, eur: usd * rates.EUR, rub: usd * rates.RUB }; sources[t] = "safe.trade"; }
       });
-      if (debugOut) debugOut.safeTradeFx = { rates: rates ? "ok" : null, fromSafeTrade };
+      if (debugOut) debugOut.safeTradeFx = { rates: rates ? "ok" : null, fromSafeTrade, detail: safeDebug };
     } catch (e) {
       if (debugOut) debugOut.safeTradeError = e && e.message ? e.message : String(e);
     }
