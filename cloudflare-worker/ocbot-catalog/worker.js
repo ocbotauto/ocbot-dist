@@ -125,11 +125,18 @@ async function resolveAndStoreCgId(env, ticker) {
 // каждый — лишнее, она и так отдаёт все пары одним запросом). Это модульная переменная воркера — живёт,
 // пока жив конкретный изолят Cloudflare, сбрасывается между холодными стартами, это ожидаемо.
 let safeTradeTickersPromise = null;
+const safeTradeDebug = { status: null, error: null, bodyStart: null };
 function safeTradeTickers() {
   if (!safeTradeTickersPromise) {
-    safeTradeTickersPromise = fetch("https://safe.trade/api/v2/tickers")
-      .then((r) => (r.ok ? r.json() : null))
-      .catch(() => null);
+    safeTradeTickersPromise = fetch("https://safe.trade/api/v2/tickers", {
+      headers: { accept: "application/json", "user-agent": "ocbot-catalog-worker/1.0 (+https://ocbot.org)" },
+    })
+      .then(async (r) => {
+        safeTradeDebug.status = r.status;
+        if (!r.ok) { safeTradeDebug.bodyStart = (await r.text().catch(() => "")).slice(0, 200); return null; }
+        return r.json();
+      })
+      .catch((e) => { safeTradeDebug.error = e && e.message ? e.message : String(e); return null; });
   }
   return safeTradeTickersPromise;
 }
@@ -429,7 +436,7 @@ async function getPrices(env, tickers, debugOut) {
         const usd = fromSafeTrade[i];
         if (usd != null && rates) { fresh[t] = { usd, eur: usd * rates.EUR, rub: usd * rates.RUB }; sources[t] = "safe.trade"; }
       });
-      if (debugOut) debugOut.safeTradeFx = { rates: rates ? "ok" : null, fromSafeTrade, detail: safeDebug };
+      if (debugOut) debugOut.safeTradeFx = { rates: rates ? "ok" : null, fromSafeTrade, detail: safeDebug, fetchDebug: safeTradeDebug };
     } catch (e) {
       if (debugOut) debugOut.safeTradeError = e && e.message ? e.message : String(e);
     }
