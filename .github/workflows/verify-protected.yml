@@ -50,7 +50,10 @@ jobs:
               "https://www.virustotal.com/api/v3/files/$HASH" -o /tmp/vt_report.json
           fi
 
-          python3 - "$HASH" <<'PYEOF'
+          # Эта команда НЕ прерывает джобу через exit(1) — она только пишет vt-status.json
+          # и выставляет output "clean". Решение остановить/откатить релиз принимает
+          # отдельный шаг ниже, чтобы результат сначала гарантированно закоммитился.
+          python3 - "$HASH" <<'PYEOF' >> "$GITHUB_OUTPUT"
           import json, sys, datetime
           h = sys.argv[1]
           d = json.load(open('/tmp/vt_report.json'))['data']['attributes']
@@ -68,16 +71,13 @@ jobs:
               "scanned_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
           }
           json.dump(out, open('vt-status.json', 'w'), ensure_ascii=False, indent=2)
-          print(json.dumps(out, ensure_ascii=False, indent=2))
-          if not out["clean"]:
-              print("::error::VirusTotal пометил сборку как подозрительную/вредоносную — релиз остановлен")
-              sys.exit(1)
+          print(json.dumps(out, ensure_ascii=False, indent=2), file=sys.stderr)
+          print("clean=" + ("true" if out["clean"] else "false"))
           PYEOF
+        id: vtscan
 
       - name: Закоммитить результат сканирования
         if: ${{ env.VT_API_KEY != '' }}
-        env:
-          VT_API_KEY: ${{ secrets.VT_API_KEY }}
         run: |
           set -euo pipefail
           if [ -f vt-status.json ]; then
@@ -93,3 +93,14 @@ jobs:
               echo "vt-status.json не изменился — коммит не нужен"
             fi
           fi
+
+      - name: Откатить релиз, если VirusTotal что-то нашёл
+        if: ${{ env.VT_API_KEY != '' && steps.vtscan.outputs.clean == 'false' }}
+        run: |
+          set -euo pipefail
+          git config user.name "ocbot-ci"
+          git config user.email "ci@ocbotauto.users.noreply.github.com"
+          echo "::error::VirusTotal пометил сборку как подозрительную/вредоносную — откатываю релизный коммит ${{ github.sha }}"
+          git revert --no-edit "${{ github.sha }}"
+          git push
+          exit 1
