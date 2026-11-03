@@ -6,5 +6,6 @@
 (см. комментарии в коде); привязка к GitHub Actions не настроена.
 
 Биндинги (Settings → Variables and Secrets в Cloudflare, без изменений этим коммитом):
-`ADMIN_KEY`, `CATALOG` (KV namespace), `CATALOG_WORKER_URL`, `MIN_RIGS`, `SALT` (secret),
-`TG_BOT_TOKEN` (secret), `TG_OWNER_CHAT_ID` (secret).
+`ADMIN_KEY`, `CATALOG` (KV namespace), `CATALOG_WORKER_URL`, `SALT` (secret),
+`TG_BOT_TOKEN` (secret), `TG_OWNER_CHAT_ID` (secret). Переменная `MIN_RIGS`, если осталась
+от старой версии, больше ни на что не влияет — можно удалить.

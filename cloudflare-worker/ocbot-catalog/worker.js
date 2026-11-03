@@ -3,12 +3,13 @@
 // IP не хранится и не логируется. Идентификатор рига хранится только как HMAC с секретом SALT.
 //
 // Запись видна в каталоге уже после ПЕРВОГО рига, который её подтвердил (минимум доказательности — 1 риг).
-// По каждой связке (модель+память+алгоритм+майнер+версия+цель) хранится ОДНА накопительная запись — лучший
-// результат, который когда-либо прислал любой риг. Новый риг заменяет её, только если его результат ЛУЧШЕ;
-// если риг, когда-то давший лучший результат, позже переключился на другой алгоритм или перестал писать —
-// его старый лучший результат в каталоге всё равно остаётся (данные копятся, а не стираются). Количество
-// РАЗНЫХ ригов, когда-либо подтвердивших связку, хранится отдельно и растёт только вверх — используется
-// сайтом как индикатор доверия («мало данных» / «подтверждено» / «надёжно»), а не как условие показа.
+// Каталог собирается из СВЕЖИХ снапшотов rig:* (последняя присылка каждого рига), а не из когда-либо
+// накопленных best:*: раньше best только рос, и пресет, оказавшийся позже нестабильным и переподобранный
+// ниже, оставался на сайте навсегда. Теперь переподобравший ниже риг при следующей присылке сам опускает
+// запись, связки старых версий майнера выпадают, когда риги обновились и перестали их присылать, а риги,
+// молчащие дольше STALE_RIG_MS, выпадают из каталога сами (бот шлёт heartbeat раз в сутки, см. share.py).
+// Количество РАЗНЫХ ригов, ДЕРЖАЩИХ связку сейчас, используется сайтом как индикатор доверия
+// («мало данных» / «подтверждено» / «надёжно»), а не как условие показа.
 
 const OBJ = ["", "efficiency", "compromise", "hashrate"];
 const CORS = {
@@ -204,38 +205,43 @@ async function notifyNewAlgos(env, entries) {
   }
 }
 
-// Накопительно обновляет запись по каждой присланной связке: заменяет лучший результат, только если новый
-// действительно лучше; независимо от этого учитывает рига (если он ещё не учтён) в счётчике rigs — тот
-// растёт только вверх и не зависит от того, остаётся ли этот риг сейчас на той же связке.
-async function updateBests(env, entries, rigHash) {
-  const puts = [];
-  for (const e of entries) {
-    const key = "best:" + comboKey(e);
-    const cur = await env.CATALOG.get(key, "json");
-    const seen = (cur && cur.rigs_seen) || [];
-    const isNewRig = !seen.includes(rigHash);
-    const better = !cur || score(e) > score(cur);
-    if (!better && !isNewRig) continue;              // ничего не меняется: экономим запись в KV
-    const rigs_seen = isNewRig ? [...seen, rigHash].slice(-200) : seen;
-    const base = better ? e : cur;                    // лучший результат меняем, только когда реально лучше
-    puts.push(env.CATALOG.put(key, JSON.stringify({ ...base, rigs: rigs_seen.length, rigs_seen, updated_at: new Date().toISOString() })));
-  }
-  await Promise.all(puts);
-}
+// Снапшот рига старше этого срока выпадает из каталога: молчащий риг — это
+// выключенный/переехавший риг, его пресеты не должны жить на сайте вечно.
+// Бот присылает heartbeat раз в сутки (share.py), поэтому живой риг с
+// давно подобранными стабильными пресетами из каталога не пропадает.
+const STALE_RIG_MS = 7 * 24 * 60 * 60 * 1000;
 
-async function allBests(env) {
-  const out = [];
+// Каталог из свежих снапшотов rig:*: по связке берётся лучший СЕЙЧАС держащий её
+// результат (не исторический максимум), медиана — от рига с наибольшим числом
+// карт, rigs/cards — сколько ригов/карт держат связку сейчас.
+async function currentCatalog(env) {
+  const now = Date.now();
+  const byCombo = new Map();
   let cursor;
   do {
-    const page = await env.CATALOG.list({ prefix: "best:", cursor });
+    const page = await env.CATALOG.list({ prefix: "rig:", cursor });
     for (const k of page.keys) {
       const d = await env.CATALOG.get(k.name, "json");
-      if (d) out.push(d);
+      if (!d || !d.t || now - d.t > STALE_RIG_MS || !Array.isArray(d.entries)) continue;
+      for (const e of d.entries) {
+        const key = comboKey(e);
+        let g = byCombo.get(key);
+        if (!g) { g = { best: e, med: e, rigs: 0, cards: 0, t: 0 }; byCombo.set(key, g); }
+        g.rigs += 1;
+        g.cards += e.cards || 1;
+        if ((e.cards || 1) >= (g.med.cards || 1)) g.med = e;
+        if (score(e) > score(g.best)) g.best = e;
+        if (d.t > g.t) g.t = d.t;
+      }
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
+  const out = [];
+  for (const g of byCombo.values()) {
+    out.push({ ...g.best, median: g.med.median, cards: g.cards, rigs: g.rigs, updated_at: new Date(g.t).toISOString() });
+  }
   out.sort((a, b) => (a.model + a.algo + a.miner + a.objective).localeCompare(b.model + b.algo + b.miner + b.objective));
-  return out.map(({ rigs_seen, ...rest }) => rest);   // наружу хэши ригов, по которым считали rigs, не отдаём
+  return out;
 }
 
 // --- Цена монеты на сервере (/price.json) -----------------------------------------------------------
@@ -692,7 +698,7 @@ export default {
     if (req.method === "GET" && url.pathname === "/catalog.json") {
       let cached = await env.CATALOG.get("cache", "json");
       if (!cached || Date.now() - cached.t > 15 * 60 * 1000) {
-        const entries = await allBests(env);
+        const entries = await currentCatalog(env);
         cached = { t: Date.now(), body: { format: "ocbot-catalog", version: 1, created_at: new Date().toISOString(), label: "общий каталог", entries } };
         await env.CATALOG.put("cache", JSON.stringify(cached));
       }
@@ -718,7 +724,7 @@ export default {
       if (prev && Date.now() - prev.t < 60 * 60 * 1000) return json({ ok: false, error: "too often" }, 429);
       // присылка только с точками кривой не должна затирать прежние пресеты рига
       await env.CATALOG.put(key, JSON.stringify({ t: Date.now(), day: new Date().toISOString().slice(0, 10), entries: entries.length ? entries : (prev && prev.entries) || [] }));
-      await updateBests(env, entries, rh);
+      // каталог пересчитается из свежих снапшотов при следующем запросе (кэш 15 мин)
       await notifyNewAlgos(env, entries);
       const points = curves.length ? await storeCurves(env, curves, rh) : 0;
       return json({ ok: true, accepted: entries.length, ...(points ? { points } : {}) });
@@ -795,25 +801,20 @@ export default {
       return json({ ok: true, ticker, candidates: coins, picked: best });
     }
 
-    // Одноразовый пересчёт best:* из уже лежащих в хранилище сырых присылок ригов (rig:*) — нужен один раз
-    // сразу после перехода со старой логики (порог в 3 рига), чтобы не ждать, пока все риги пришлют заново
-    // то, что они и так уже присылали раньше. Безопасно вызывать повторно (ничего не портит, просто тратит
-    // время) — можно удалить этот блок после первого использования, но не обязательно.
+    // Чистка после перехода на каталог из свежих снапшотов rig:* (04.11): удаляет
+    // накопленные best:* (больше не читаются нигде) и сбрасывает кэш каталога.
+    // Безопасно вызывать повторно. В отличие от старого backfill, меняет данные,
+    // поэтому требует ADMIN_KEY.
     if (url.pathname === "/admin/backfill") {
-      let migrated = 0, cursor;
+      if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) return json({ ok: false, error: "forbidden" }, 403);
+      let removed = 0, cursor;
       do {
-        const page = await env.CATALOG.list({ prefix: "rig:", cursor });
-        for (const k of page.keys) {
-          const d = await env.CATALOG.get(k.name, "json");
-          if (d && Array.isArray(d.entries) && d.entries.length) {
-            await updateBests(env, d.entries, k.name.slice("rig:".length));
-            migrated++;
-          }
-        }
+        const page = await env.CATALOG.list({ prefix: "best:", cursor });
+        for (const k of page.keys) { await env.CATALOG.delete(k.name); removed++; }
         cursor = page.list_complete ? undefined : page.cursor;
       } while (cursor);
       await env.CATALOG.delete("cache");
-      return json({ ok: true, rigs_scanned: migrated });
+      return json({ ok: true, best_removed: removed });
     }
 
     // Таблицы «разгон → хешрейт» по моделям (страницы моделей на сайте собираются из этого файла).
