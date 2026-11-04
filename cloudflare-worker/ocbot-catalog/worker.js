@@ -9,7 +9,10 @@
 // запись, связки старых версий майнера выпадают, когда риги обновились и перестали их присылать, а риги,
 // молчащие дольше STALE_RIG_MS, выпадают из каталога сами (бот шлёт heartbeat раз в сутки, см. share.py).
 // Количество РАЗНЫХ ригов, ДЕРЖАЩИХ связку сейчас, используется сайтом как индикатор доверия
-// («мало данных» / «подтверждено» / «надёжно»), а не как условие показа.
+// («мало данных» / «подтверждено» / «надёжно»), а не как условие показа. Отдельно ведётся постоянный
+// архив hist:* (исторический максимум, первый/последний контакт, сколько ригов когда-либо держали
+// связку) — он только копится и отдаётся через /history.json: база знаний сайта о редких картах
+// и алгоритмах не теряется, даже когда все риги ушли со связки.
 
 const OBJ = ["", "efficiency", "compromise", "hashrate"];
 const CORS = {
@@ -242,6 +245,46 @@ async function currentCatalog(env) {
   }
   out.sort((a, b) => (a.model + a.algo + a.miner + a.objective).localeCompare(b.model + b.algo + b.miner + b.objective));
   return out;
+}
+
+// Постоянный архив по связке (hist:*): исторический максимум, первый/последний контакт и сколько
+// разных ригов когда-либо держали связку. В отличие от catalog.json (что держат СЕЙЧАС), архив
+// только копится — это «база знаний» сайта: редкие карты/алгоритмы не теряются, даже когда все риги
+// ушли со связки. Запись не чаще раза в сутки на связку, если результат не стал лучше (лимит KV).
+async function updateHistory(env, entries, rigHash) {
+  const now = Date.now();
+  for (const e of entries) {
+    const key = "hist:" + comboKey(e);
+    const cur = await env.CATALOG.get(key, "json");
+    const seen = (cur && cur.rigs_seen) || [];
+    const isNewRig = !seen.includes(rigHash);
+    const better = !cur || score(e) > score(cur);
+    const fresh = cur && cur.t && now - cur.t < 24 * 3600 * 1000;
+    if (!better && !isNewRig && fresh) continue;      // менять нечего — экономим запись в KV
+    const rigs_seen = isNewRig ? [...seen, rigHash].slice(-200) : seen;
+    const base = better ? e : cur;
+    await env.CATALOG.put(key, JSON.stringify({
+      ...base, t: now,
+      first_seen: (cur && cur.first_seen) || new Date(now).toISOString(),
+      last_seen: new Date(now).toISOString(),
+      rigs_total: rigs_seen.length, rigs_seen,
+    }));
+  }
+}
+
+async function allHistory(env) {
+  const out = [];
+  let cursor;
+  do {
+    const page = await env.CATALOG.list({ prefix: "hist:", cursor });
+    for (const k of page.keys) {
+      const d = await env.CATALOG.get(k.name, "json");
+      if (d) out.push(d);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  out.sort((a, b) => (a.model + a.algo + a.miner + a.objective).localeCompare(b.model + b.algo + b.miner + b.objective));
+  return out.map(({ rigs_seen, t, ...rest }) => rest);   // наружу хэши ригов и служебное время записи не отдаём
 }
 
 // --- Цена монеты на сервере (/price.json) -----------------------------------------------------------
@@ -724,7 +767,9 @@ export default {
       if (prev && Date.now() - prev.t < 60 * 60 * 1000) return json({ ok: false, error: "too often" }, 429);
       // присылка только с точками кривой не должна затирать прежние пресеты рига
       await env.CATALOG.put(key, JSON.stringify({ t: Date.now(), day: new Date().toISOString().slice(0, 10), entries: entries.length ? entries : (prev && prev.entries) || [] }));
-      // каталог пересчитается из свежих снапшотов при следующем запросе (кэш 15 мин)
+      // каталог пересчитается из свежих снапшотов при следующем запросе (кэш 15 мин);
+      // архив hist:* копится отдельно и от устаревания не зависит
+      await updateHistory(env, entries, rh);
       await notifyNewAlgos(env, entries);
       const points = curves.length ? await storeCurves(env, curves, rh) : 0;
       return json({ ok: true, accepted: entries.length, ...(points ? { points } : {}) });
@@ -802,19 +847,44 @@ export default {
     }
 
     // Чистка после перехода на каталог из свежих снапшотов rig:* (04.11): удаляет
-    // накопленные best:* (больше не читаются нигде) и сбрасывает кэш каталога.
-    // Безопасно вызывать повторно. В отличие от старого backfill, меняет данные,
-    // поэтому требует ADMIN_KEY.
+    // накопленные best:* (больше не читаются нигде), сбрасывает кэш каталога и засевает
+    // постоянный архив hist:* из текущих снапшотов rig:*. Безопасно вызывать повторно.
+    // Меняет данные, поэтому требует ADMIN_KEY.
     if (url.pathname === "/admin/backfill") {
       if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) return json({ ok: false, error: "forbidden" }, 403);
-      let removed = 0, cursor;
+      let removed = 0, seeded = 0, cursor;
       do {
         const page = await env.CATALOG.list({ prefix: "best:", cursor });
         for (const k of page.keys) { await env.CATALOG.delete(k.name); removed++; }
         cursor = page.list_complete ? undefined : page.cursor;
       } while (cursor);
+      cursor = undefined;
+      do {
+        const page = await env.CATALOG.list({ prefix: "rig:", cursor });
+        for (const k of page.keys) {
+          const d = await env.CATALOG.get(k.name, "json");
+          if (d && Array.isArray(d.entries) && d.entries.length) {
+            await updateHistory(env, d.entries, k.name.slice("rig:".length));
+            seeded++;
+          }
+        }
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
       await env.CATALOG.delete("cache");
-      return json({ ok: true, best_removed: removed });
+      await env.CATALOG.delete("hist_cache");
+      return json({ ok: true, best_removed: removed, history_seeded: seeded });
+    }
+
+    // Постоянный архив связок (см. updateHistory): исторический максимум по каждой связке,
+    // первый/последний контакт, сколько ригов когда-либо держали. Копится бессрочно — база сайта.
+    if (req.method === "GET" && url.pathname === "/history.json") {
+      let cached = await env.CATALOG.get("hist_cache", "json");
+      if (!cached || Date.now() - cached.t > 15 * 60 * 1000) {
+        const entries = await allHistory(env);
+        cached = { t: Date.now(), body: { format: "ocbot-history", version: 1, created_at: new Date().toISOString(), entries } };
+        await env.CATALOG.put("hist_cache", JSON.stringify(cached));
+      }
+      return json(cached.body, 200, { "cache-control": "public, max-age=300" });
     }
 
     // Таблицы «разгон → хешрейт» по моделям (страницы моделей на сайте собираются из этого файла).
